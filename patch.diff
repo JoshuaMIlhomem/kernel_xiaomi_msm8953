@@ -1,0 +1,732 @@
+From 28b2fa3077a43fdde983ead34a6098f1057f93f0 Mon Sep 17 00:00:00 2001
+From: Steve Kondik <steve@cyngn.com>
+Date: Fri, 4 Sep 2015 12:49:16 -0700
+Subject: [PATCH] leds-aw2013: Don't reset values when nothing has changed
+
+ * This will allow us to eliminate the flickering when changing params.
+ * Also fix the unbalanced disable in eror conditions.
+
+TOMATOL-565
+Change-Id: If5f6fde1e29e60b7f65ab4042a100fe9a0e90e66
+(cherry picked from commit 9c3c0ee268c3ddc10c8215a903e8ad69fbaedcbf)
+---
+ drivers/leds/leds-aw2013.c | 20 ++++++++++++++------
+ 1 file changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/leds/leds-aw2013.c b/drivers/leds/leds-aw2013.c
+index 1c7637f789b8..8beec9ddf69f 100644
+--- a/drivers/leds/leds-aw2013.c
++++ b/drivers/leds/leds-aw2013.c
+@@ -315,7 +315,7 @@ static void aw2013_led_work(struct work_struct *work)
+ 	 * If value in AW_REG_LED_ENABLE is 0, it means the RGB leds are
+ 	 * all off. So we need to power it off.
+ 	 */
+-	if (val == 0) {
++	if (val == 0 && led->pdata->led->poweron) {
+ 		if (aw2013_power_on(led->pdata->led, false)) {
+ 			dev_err(&led->pdata->led->client->dev,
+ 				"power off failed");
+@@ -365,7 +365,8 @@ static ssize_t aw2013_store_blink(struct device *dev,
+ 	mutex_lock(&led->pdata->led->lock);
+         if (led->blinking != blinking) {
+                 led->blinking = blinking;
+-                queue_work(led->workqueue, &led->work);
++                if (led->cdev.brightness > 0)
++                        queue_work(led->workqueue, &led->work);
+         }
+ 	mutex_unlock(&led->pdata->led->lock);
+ 
+@@ -408,14 +409,21 @@ static ssize_t aw2013_led_time_store(struct device *dev,
+ 			&fall_time_ms, &off_time_ms);
+ 
+ 	mutex_lock(&led->pdata->led->lock);
+-	led->pdata->rise_time_ms = (rise_time_ms > MAX_RISE_TIME_MS) ?
++	if (led->pdata->rise_time_ms != rise_time_ms ||
++			led->pdata->hold_time_ms != hold_time_ms ||
++			led->pdata->fall_time_ms != fall_time_ms ||
++			led->pdata->off_time_ms  != off_time_ms) {
++		led->pdata->rise_time_ms = (rise_time_ms > MAX_RISE_TIME_MS) ?
+ 				MAX_RISE_TIME_MS : rise_time_ms;
+-	led->pdata->hold_time_ms = (hold_time_ms > MAX_HOLD_TIME_MS) ?
++		led->pdata->hold_time_ms = (hold_time_ms > MAX_HOLD_TIME_MS) ?
+ 				MAX_HOLD_TIME_MS : hold_time_ms;
+-	led->pdata->fall_time_ms = (fall_time_ms > MAX_FALL_TIME_MS) ?
++		led->pdata->fall_time_ms = (fall_time_ms > MAX_FALL_TIME_MS) ?
+ 				MAX_FALL_TIME_MS : fall_time_ms;
+-	led->pdata->off_time_ms = (off_time_ms > MAX_OFF_TIME_MS) ?
++		led->pdata->off_time_ms = (off_time_ms > MAX_OFF_TIME_MS) ?
+ 				MAX_OFF_TIME_MS : off_time_ms;
++		if (led->cdev.brightness > 0)
++			queue_work(led->workqueue, &led->work);
++	}
+ 	mutex_unlock(&led->pdata->led->lock);
+ 
+ 	return len;
+-- 
+2.17.1.windows.2
+
+From 4bc653c9c68381a188e6493bd3c7fd6df8485663 Mon Sep 17 00:00:00 2001
+From: Ethan Chen <intervigil@gmail.com>
+Date: Wed, 2 Sep 2015 18:20:06 -0700
+Subject: [PATCH] leds: aw2013: Reduce logging level
+
+Change-Id: I7c525e0064415dfc9a54d3c191615cca19bc2698
+---
+ drivers/leds/leds-aw2013.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/leds/leds-aw2013.c b/drivers/leds/leds-aw2013.c
+index 7c97c9e92b0c..1c7637f789b8 100644
+--- a/drivers/leds/leds-aw2013.c
++++ b/drivers/leds/leds-aw2013.c
+@@ -307,7 +307,7 @@ static void aw2013_led_work(struct work_struct *work)
+ 
+ 	aw2013_read(led, AW_REG_LED_ENABLE, &val);
+ 
+-	dev_info(&led->pdata->led->client->dev,
++	dev_dbg(&led->pdata->led->client->dev,
+ 			"%s: enabled=%d brightness=%d blinking=%d",
+ 			__func__, val, led->cdev.brightness, led->blinking);
+ 
+@@ -336,7 +336,7 @@ static void aw2013_set_brightness(struct led_classdev *cdev,
+         if (brightness > led->cdev.max_brightness)
+                 brightness = led->cdev.max_brightness;
+ 
+-        dev_info(&led->pdata->led->client->dev,
++        dev_dbg(&led->pdata->led->client->dev,
+                         "%s cur=%d new=%d", __func__, led->brightness, brightness);
+ 
+         if (led->brightness != brightness) {
+-- 
+2.17.1.windows.2
+
+From 6470039307c3ed260200e50ed25c92f686f156d1 Mon Sep 17 00:00:00 2001
+From: Steve Kondik <steve@cyngn.com>
+Date: Tue, 1 Sep 2015 18:54:13 -0700
+Subject: [PATCH] leds: aw2013: Use an ordered workqueue for command processing
+
+ * It's not acceptable to make userspace wait, so if we send the blink
+   command then queue it up behind any other pending changes.
+ * Be smarter when sending commands to avoid flicker.
+ * Streamline the code so that we don't cause big delays
+   in userspace when changing lights.
+
+Change-Id: I36dd6bd910267f4b6df0cf6ed1de0d173ae5aace
+---
+ drivers/leds/leds-aw2013.c | 184 +++++++++++++++++--------------------
+ 1 file changed, 85 insertions(+), 99 deletions(-)
+
+diff --git a/drivers/leds/leds-aw2013.c b/drivers/leds/leds-aw2013.c
+index 0c0ccae6262d..7c97c9e92b0c 100644
+--- a/drivers/leds/leds-aw2013.c
++++ b/drivers/leds/leds-aw2013.c
+@@ -56,13 +56,17 @@ struct aw2013_led {
+ 	struct i2c_client *client;
+ 	struct led_classdev cdev;
+ 	struct aw2013_platform_data *pdata;
+-	struct work_struct brightness_work;
++	struct work_struct work;
++	struct workqueue_struct *workqueue;
+ 	struct mutex lock;
+ 	struct regulator *vdd;
+ 	struct regulator *vcc;
+ 	int num_leds;
+ 	int id;
+ 	bool poweron;
++	bool blinking;
++	bool cur_blinking;
++	int brightness;
+ };
+ 
+ static int aw2013_write(struct aw2013_led *led, u8 reg, u8 val)
+@@ -245,115 +249,68 @@ reg_vdd_put:
+ 	return rc;
+ }
+ 
+-static void aw2013_brightness_work(struct work_struct *work)
++static void aw2013_led_work(struct work_struct *work)
+ {
+ 	struct aw2013_led *led = container_of(work, struct aw2013_led,
+-					brightness_work);
++					work);
+ 	u8 val;
+ 
+ 	mutex_lock(&led->pdata->led->lock);
+ 
+-	/* enable regulators if they are disabled */
+-	if (!led->pdata->led->poweron) {
+-		if (aw2013_power_on(led->pdata->led, true)) {
+-			dev_err(&led->pdata->led->client->dev, "power on failed");
+-			mutex_unlock(&led->pdata->led->lock);
+-			return;
++	if (led->cdev.brightness > 0) {
++		/* enable regulators if they are disabled */
++		if (!led->pdata->led->poweron) {
++			if (aw2013_power_on(led->pdata->led, true)) {
++				dev_err(&led->pdata->led->client->dev, "power on failed");
++				goto out;
++			}
+ 		}
+-	}
+ 
+-	if (led->cdev.brightness > 0) {
+-		if (led->cdev.brightness > led->cdev.max_brightness)
+-			led->cdev.brightness = led->cdev.max_brightness;
+ 		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
+ 			AW_LED_MOUDLE_ENABLE_MASK);
+-		aw2013_write(led, AW_REG_LED_CONFIG_BASE + led->id,
+-			led->pdata->max_current);
+-		aw2013_write(led, AW_REG_LED_BRIGHTNESS_BASE + led->id,
+-			led->cdev.brightness);
+-		aw2013_read(led, AW_REG_LED_ENABLE, &val);
+-		aw2013_write(led, AW_REG_LED_ENABLE, val | (1 << led->id));
+-	} else {
+-		aw2013_read(led, AW_REG_LED_ENABLE, &val);
+-		aw2013_write(led, AW_REG_LED_ENABLE, val & (~(1 << led->id)));
+-	}
+-
+-	aw2013_read(led, AW_REG_LED_ENABLE, &val);
+-	/*
+-	 * If value in AW_REG_LED_ENABLE is 0, it means the RGB leds are
+-	 * all off. So we need to power it off.
+-	 */
+-	if (val == 0) {
+-		if (aw2013_power_on(led->pdata->led, false)) {
+-			dev_err(&led->pdata->led->client->dev,
+-				"power off failed");
+-			mutex_unlock(&led->pdata->led->lock);
+-			return;
+-		}
+-	}
+-
+-	mutex_unlock(&led->pdata->led->lock);
+-}
+-
+-static void aw2013_led_blink_set(struct aw2013_led *led, unsigned long blinking)
+-{
+-	u8 val;
+ 
+-	/* enable regulators if they are disabled */
+-	if (!led->pdata->led->poweron) {
+-		if (aw2013_power_on(led->pdata->led, true)) {
+-			dev_err(&led->pdata->led->client->dev, "power on failed");
+-			return;
++		if (led->blinking) {
++			aw2013_write(led, AW_REG_LED_CONFIG_BASE + led->id,
++				AW_LED_FADE_OFF_MASK | AW_LED_FADE_ON_MASK |
++				AW_LED_BREATHE_MODE_MASK | led->pdata->max_current);
++			aw2013_write(led, AW_REG_TIMESET0_BASE + led->id * 3,
++				led->pdata->rise_time_ms << 4 |
++				led->pdata->hold_time_ms);
++			aw2013_write(led, AW_REG_TIMESET1_BASE + led->id * 3,
++				led->pdata->fall_time_ms << 4 |
++				led->pdata->off_time_ms);
++		} else {
++			aw2013_write(led, AW_REG_LED_CONFIG_BASE + led->id,
++				led->pdata->max_current);
+ 		}
+-	}
+ 
+-	if (!led->cdev.brightness)
+-		led->cdev.brightness = blinking ? led->cdev.max_brightness : 0;
+-
+-	if (blinking > 0) {
+-		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
+-			AW_LED_MOUDLE_ENABLE_MASK);
+-		aw2013_write(led, AW_REG_LED_CONFIG_BASE + led->id,
+-			AW_LED_FADE_OFF_MASK | AW_LED_FADE_ON_MASK |
+-			AW_LED_BREATHE_MODE_MASK | led->pdata->max_current);
+ 		aw2013_write(led, AW_REG_LED_BRIGHTNESS_BASE + led->id,
+ 			led->cdev.brightness);
+-		aw2013_write(led, AW_REG_TIMESET0_BASE + led->id * 3,
+-			led->pdata->rise_time_ms << 4 |
+-			led->pdata->hold_time_ms);
+-		aw2013_write(led, AW_REG_TIMESET1_BASE + led->id * 3,
+-			led->pdata->fall_time_ms << 4 |
+-			led->pdata->off_time_ms);
+ 		aw2013_read(led, AW_REG_LED_ENABLE, &val);
+-                // sync up the blinking by pulling them all down first
+-		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
+-			0);
+-		aw2013_write(led, AW_REG_LED_ENABLE, 0);
+-		msleep(50);
+-		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
+-			AW_LED_MOUDLE_ENABLE_MASK);
++
++		if (led->blinking != led->cur_blinking) {
++			// sync up the blinking by pulling them all down first
++			aw2013_write(led, AW_REG_GLOBAL_CONTROL, 0);
++			aw2013_write(led, AW_REG_LED_ENABLE, 0);
++			msleep(50);
++			aw2013_write(led, AW_REG_GLOBAL_CONTROL,
++					AW_LED_MOUDLE_ENABLE_MASK);
++			led->cur_blinking = led->blinking;
++		}
++
+ 		aw2013_write(led, AW_REG_LED_ENABLE, val | (1 << led->id));
+ 	} else {
+ 		aw2013_read(led, AW_REG_LED_ENABLE, &val);
+ 		aw2013_write(led, AW_REG_LED_ENABLE, val & (~(1 << led->id)));
+-		if (led->cdev.brightness) {
+-			// Disabling blink doesn't shut down the LED, put it
+-			// back up after clearing the timers
+-			if (led->cdev.brightness > led->cdev.max_brightness)
+-				led->cdev.brightness = led->cdev.max_brightness;
+-			aw2013_write(led, AW_REG_GLOBAL_CONTROL,
+-					AW_LED_MOUDLE_ENABLE_MASK);
+-			aw2013_write(led, AW_REG_LED_CONFIG_BASE + led->id,
+-					led->pdata->max_current);
+-			aw2013_write(led, AW_REG_LED_BRIGHTNESS_BASE + led->id,
+-					led->cdev.brightness);
+-			aw2013_write(led, AW_REG_LED_BRIGHTNESS_BASE + led->id,
+-				led->cdev.brightness);
+-			aw2013_write(led, AW_REG_LED_ENABLE, val);
+-		}
++		led->blinking = led->cur_blinking = false;
+ 	}
+ 
+ 	aw2013_read(led, AW_REG_LED_ENABLE, &val);
++
++	dev_info(&led->pdata->led->client->dev,
++			"%s: enabled=%d brightness=%d blinking=%d",
++			__func__, val, led->cdev.brightness, led->blinking);
++
+ 	/*
+ 	 * If value in AW_REG_LED_ENABLE is 0, it means the RGB leds are
+ 	 * all off. So we need to power it off.
+@@ -362,9 +319,12 @@ static void aw2013_led_blink_set(struct aw2013_led *led, unsigned long blinking)
+ 		if (aw2013_power_on(led->pdata->led, false)) {
+ 			dev_err(&led->pdata->led->client->dev,
+ 				"power off failed");
+-			return;
++			goto out;
+ 		}
+ 	}
++
++out:
++        mutex_unlock(&led->pdata->led->lock);
+ }
+ 
+ static void aw2013_set_brightness(struct led_classdev *cdev,
+@@ -372,31 +332,56 @@ static void aw2013_set_brightness(struct led_classdev *cdev,
+ {
+ 	struct aw2013_led *led = container_of(cdev, struct aw2013_led, cdev);
+ 
+-	led->cdev.brightness = brightness;
++        mutex_lock(&led->pdata->led->lock);
++        if (brightness > led->cdev.max_brightness)
++                brightness = led->cdev.max_brightness;
+ 
+-	schedule_work(&led->brightness_work);
++        dev_info(&led->pdata->led->client->dev,
++                        "%s cur=%d new=%d", __func__, led->brightness, brightness);
++
++        if (led->brightness != brightness) {
++                led->brightness = brightness;
++                queue_work(led->workqueue, &led->work);
++        }
++        mutex_unlock(&led->pdata->led->lock);
+ }
+ 
+ static ssize_t aw2013_store_blink(struct device *dev,
+ 			     struct device_attribute *attr,
+ 			     const char *buf, size_t len)
+ {
+-	unsigned long blinking;
++        unsigned long val;
++        bool blinking;
+ 	struct led_classdev *led_cdev = dev_get_drvdata(dev);
+ 	struct aw2013_led *led =
+ 			container_of(led_cdev, struct aw2013_led, cdev);
+ 	ssize_t ret = -EINVAL;
+ 
+-	ret = kstrtoul(buf, 10, &blinking);
++	ret = kstrtoul(buf, 10, &val);
+ 	if (ret)
+ 		return ret;
++
++        blinking = val > 0;
+ 	mutex_lock(&led->pdata->led->lock);
+-	aw2013_led_blink_set(led, blinking);
++        if (led->blinking != blinking) {
++                led->blinking = blinking;
++                queue_work(led->workqueue, &led->work);
++        }
+ 	mutex_unlock(&led->pdata->led->lock);
+ 
+ 	return len;
+ }
+ 
++static ssize_t aw2013_show_blink(struct device *dev,
++                               struct device_attribute *attr, char *buf)
++{
++       struct led_classdev *led_cdev = dev_get_drvdata(dev);
++       struct aw2013_led *led =
++                       container_of(led_cdev, struct aw2013_led, cdev);
++
++       return snprintf(buf, PAGE_SIZE, "%d\n", led->blinking ? 1 : 0);
++}
++
+ static ssize_t aw2013_led_time_show(struct device *dev,
+ 				struct device_attribute *attr, char *buf)
+ {
+@@ -431,12 +416,12 @@ static ssize_t aw2013_led_time_store(struct device *dev,
+ 				MAX_FALL_TIME_MS : fall_time_ms;
+ 	led->pdata->off_time_ms = (off_time_ms > MAX_OFF_TIME_MS) ?
+ 				MAX_OFF_TIME_MS : off_time_ms;
+-	aw2013_led_blink_set(led, 1);
+ 	mutex_unlock(&led->pdata->led->lock);
++
+ 	return len;
+ }
+ 
+-static DEVICE_ATTR(blink, 0664, NULL, aw2013_store_blink);
++static DEVICE_ATTR(blink, 0664, aw2013_show_blink, aw2013_store_blink);
+ static DEVICE_ATTR(led_time, 0664, aw2013_led_time_show, aw2013_led_time_store);
+ 
+ static struct attribute *aw2013_led_attributes[] = {
+@@ -474,7 +459,7 @@ static int aw2013_led_err_handle(struct aw2013_led *led_array,
+ 		sysfs_remove_group(&led_array[i].cdev.dev->kobj,
+ 				&aw2013_led_attr_group);
+ 		led_classdev_unregister(&led_array[i].cdev);
+-		cancel_work_sync(&led_array[i].brightness_work);
++		cancel_work_sync(&led_array[i].work);
+ 		devm_kfree(&led_array->client->dev, led_array[i].pdata);
+ 		led_array[i].pdata = NULL;
+ 	}
+@@ -575,7 +560,8 @@ static int aw2013_led_parse_child_node(struct aw2013_led *led_array,
+ 			goto free_pdata;
+ 		}
+ 
+-		INIT_WORK(&led->brightness_work, aw2013_brightness_work);
++		INIT_WORK(&led->work, aw2013_led_work);
++		led->workqueue = alloc_ordered_workqueue("aw2013_workqueue", 0);
+ 
+ 		led->cdev.brightness_set = aw2013_set_brightness;
+ 
+@@ -601,7 +587,7 @@ static int aw2013_led_parse_child_node(struct aw2013_led *led_array,
+ free_class:
+ 	aw2013_led_err_handle(led_array, parsed_leds);
+ 	led_classdev_unregister(&led_array[parsed_leds].cdev);
+-	cancel_work_sync(&led_array[parsed_leds].brightness_work);
++	cancel_work_sync(&led_array[parsed_leds].work);
+ 	devm_kfree(&led->client->dev, led_array[parsed_leds].pdata);
+ 	led_array[parsed_leds].pdata = NULL;
+ 	return rc;
+@@ -682,7 +668,7 @@ static int aw2013_led_remove(struct i2c_client *client)
+ 		sysfs_remove_group(&led_array[i].cdev.dev->kobj,
+ 				&aw2013_led_attr_group);
+ 		led_classdev_unregister(&led_array[i].cdev);
+-		cancel_work_sync(&led_array[i].brightness_work);
++		cancel_work_sync(&led_array[i].work);
+ 		devm_kfree(&client->dev, led_array[i].pdata);
+ 		led_array[i].pdata = NULL;
+ 	}
+-- 
+2.17.1.windows.2
+
+From 228baab2041ce59dd70a68fb5b772c7ff5b05f78 Mon Sep 17 00:00:00 2001
+From: Ricardo Cerqueira <ricardo@cyngn.com>
+Date: Thu, 18 Jun 2015 01:10:38 +0100
+Subject: [PATCH] leds: aw2013_led: Don't reset the brightness level when
+ setting blink
+
+If setting an already lit LED to blink, retain it's brightness level
+to allow for RGB color mixing. Also, sync up the blinks
+
+Change-Id: I802aad68757959b78e5a7ffc3f190b5113c645ce
+---
+ drivers/leds/leds-aw2013.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/leds/leds-aw2013.c b/drivers/leds/leds-aw2013.c
+index 433f1745c432..0c0ccae6262d 100644
+--- a/drivers/leds/leds-aw2013.c
++++ b/drivers/leds/leds-aw2013.c
+@@ -307,7 +307,8 @@ static void aw2013_led_blink_set(struct aw2013_led *led, unsigned long blinking)
+ 		}
+ 	}
+ 
+-	led->cdev.brightness = blinking ? led->cdev.max_brightness : 0;
++	if (!led->cdev.brightness)
++		led->cdev.brightness = blinking ? led->cdev.max_brightness : 0;
+ 
+ 	if (blinking > 0) {
+ 		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
+@@ -324,10 +325,32 @@ static void aw2013_led_blink_set(struct aw2013_led *led, unsigned long blinking)
+ 			led->pdata->fall_time_ms << 4 |
+ 			led->pdata->off_time_ms);
+ 		aw2013_read(led, AW_REG_LED_ENABLE, &val);
++                // sync up the blinking by pulling them all down first
++		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
++			0);
++		aw2013_write(led, AW_REG_LED_ENABLE, 0);
++		msleep(50);
++		aw2013_write(led, AW_REG_GLOBAL_CONTROL,
++			AW_LED_MOUDLE_ENABLE_MASK);
+ 		aw2013_write(led, AW_REG_LED_ENABLE, val | (1 << led->id));
+ 	} else {
+ 		aw2013_read(led, AW_REG_LED_ENABLE, &val);
+ 		aw2013_write(led, AW_REG_LED_ENABLE, val & (~(1 << led->id)));
++		if (led->cdev.brightness) {
++			// Disabling blink doesn't shut down the LED, put it
++			// back up after clearing the timers
++			if (led->cdev.brightness > led->cdev.max_brightness)
++				led->cdev.brightness = led->cdev.max_brightness;
++			aw2013_write(led, AW_REG_GLOBAL_CONTROL,
++					AW_LED_MOUDLE_ENABLE_MASK);
++			aw2013_write(led, AW_REG_LED_CONFIG_BASE + led->id,
++					led->pdata->max_current);
++			aw2013_write(led, AW_REG_LED_BRIGHTNESS_BASE + led->id,
++					led->cdev.brightness);
++			aw2013_write(led, AW_REG_LED_BRIGHTNESS_BASE + led->id,
++				led->cdev.brightness);
++			aw2013_write(led, AW_REG_LED_ENABLE, val);
++		}
+ 	}
+ 
+ 	aw2013_read(led, AW_REG_LED_ENABLE, &val);
+-- 
+2.17.1.windows.2
+
+From bba89b4952d33fd335a67d84b34a85bdd383f4aa Mon Sep 17 00:00:00 2001
+From: Ethan Chen <intervigil@gmail.com>
+Date: Tue, 26 May 2015 15:38:18 -0700
+Subject: [PATCH] leds: aw2013_led: Support configuring GPIOs before use
+
+Change-Id: Ifb1c680d3a40205f7f02dd2eee7759ac2033b4bc
+---
+ .../devicetree/bindings/leds/leds-aw2013.txt  | 10 ++++++
+ drivers/leds/leds-aw2013.c                    | 34 +++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/Documentation/devicetree/bindings/leds/leds-aw2013.txt b/Documentation/devicetree/bindings/leds/leds-aw2013.txt
+index 4b18135d6318..a5c70c0ef15e 100644
+--- a/Documentation/devicetree/bindings/leds/leds-aw2013.txt
++++ b/Documentation/devicetree/bindings/leds/leds-aw2013.txt
+@@ -11,6 +11,13 @@ Required properties:
+  - vdd-supply		: Power supply needed to power up the device
+  - vcc-supply		: Power source required to power up i2c bus
+ 
++Optional properties:
++ - pinctrl-names	: default, suspend pincontrol names, should be
++			  "aw2013_led_default", "aw2013_led_suspend" if
++			  necessary.
++ - pinctrl-0/1		: pincontrol entry reference for default,
++			  suspended states.
++
+ LED required sub-node properties:
+  - aw2013,name		: name of the LED
+  - aw2013,id		: id of the LED
+@@ -39,6 +46,9 @@ Example:
+ 		reg = <0x45>;
+ 		vdd-supply = <&pm8909_l17>;
+ 		vcc-supply = <&pm8909_l6>;
++		pinctrl-names = "aw2013_led_default", "aw2013_led_suspend";
++		pinctrl-0 = <&red_led_default &green_led_default &blue_led_default>;
++		pinctrl-1 = <&red_led_default &green_led_default &blue_led_default>;
+ 
+ 		aw2013,red {
+ 			aw2013,name = "red";
+diff --git a/drivers/leds/leds-aw2013.c b/drivers/leds/leds-aw2013.c
+index f01c43b9838f..433f1745c432 100644
+--- a/drivers/leds/leds-aw2013.c
++++ b/drivers/leds/leds-aw2013.c
+@@ -140,6 +140,35 @@ fail_disable_reg:
+ 	return rc;
+ }
+ 
++static int aw2013_configure_gpio(struct aw2013_led *led, bool on)
++{
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pinctrl_state;
++	int rc;
++
++	pinctrl = devm_pinctrl_get(&led->client->dev);
++	if (IS_ERR_OR_NULL(pinctrl)) {
++		dev_err(&led->client->dev,
++				"Failed to get pinctrl\n");
++		return -EFAULT;
++	}
++	pinctrl_state = pinctrl_lookup_state(pinctrl,
++			on ? "aw2013_led_default" : "aw2013_led_suspend");
++	if (IS_ERR_OR_NULL(pinctrl_state)) {
++		dev_err(&led->client->dev,
++				"Failed to look up pinctrl state\n");
++		return -EFAULT;
++	}
++	rc = pinctrl_select_state(pinctrl, pinctrl_state);
++	if (rc) {
++		dev_err(&led->client->dev,
++				"Failed to select pinctrl state\n");
++		return -EIO;
++	}
++
++	return 0;
++}
++
+ static int aw2013_power_init(struct aw2013_led *led, bool on)
+ {
+ 	int rc;
+@@ -165,6 +194,11 @@ static int aw2013_power_init(struct aw2013_led *led, bool on)
+ 		}
+ 
+ 		if (led->pdata->awgpio > 0) {
++			rc = aw2013_configure_gpio(led, on);
++			if (rc) {
++				dev_dbg(&led->client->dev,
++						"Failed to configure GPIO: %d\n", rc);
++			}
+ 			gpio_request(led->pdata->awgpio, "aw2013-gpio");
+ 			gpio_direction_output(led->pdata->awgpio, 1);
+ 		} else {
+-- 
+2.17.1.windows.2
+
+From 658bf4c36d8cb7e902dfeb52b17b32ea15c17856 Mon Sep 17 00:00:00 2001
+From: Ricardo Cerqueira <ricardo@cyngn.com>
+Date: Tue, 26 May 2015 11:57:21 +0100
+Subject: [PATCH] leds: aw2013_led: Allow direct GPIO control as an alternative
+ to vcc
+
+Change-Id: I1667e3f269587ba245a45bbb1b2ceae0f5cdcc00
+---
+ drivers/leds/leds-aw2013.c  | 72 +++++++++++++++++++++++--------------
+ include/linux/leds-aw2013.h |  1 +
+ 2 files changed, 46 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/leds/leds-aw2013.c b/drivers/leds/leds-aw2013.c
+index 1fa2ac5ab38e..f01c43b9838f 100644
+--- a/drivers/leds/leds-aw2013.c
++++ b/drivers/leds/leds-aw2013.c
+@@ -21,6 +21,7 @@
+ #include <linux/slab.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/leds-aw2013.h>
++#include <linux/of_gpio.h>
+ 
+ /* register address */
+ #define AW_REG_RESET			0x00
+@@ -93,11 +94,13 @@ static int aw2013_power_on(struct aw2013_led *led, bool on)
+ 			return rc;
+ 		}
+ 
+-		rc = regulator_enable(led->vcc);
+-		if (rc) {
+-			dev_err(&led->client->dev,
+-				"Regulator vcc enable failed rc=%d\n", rc);
+-			goto fail_enable_reg;
++		if (led->pdata->awgpio <= 0)  {
++			rc = regulator_enable(led->vcc);
++			if (rc) {
++				dev_err(&led->client->dev,
++						"Regulator vcc enable failed rc=%d\n", rc);
++				goto fail_enable_reg;
++			}
+ 		}
+ 		led->poweron = true;
+ 	} else {
+@@ -108,11 +111,13 @@ static int aw2013_power_on(struct aw2013_led *led, bool on)
+ 			return rc;
+ 		}
+ 
+-		rc = regulator_disable(led->vcc);
+-		if (rc) {
+-			dev_err(&led->client->dev,
+-				"Regulator vcc disable failed rc=%d\n", rc);
+-			goto fail_disable_reg;
++		if (led->pdata->awgpio <= 0)  {
++			rc = regulator_disable(led->vcc);
++			if (rc) {
++				dev_err(&led->client->dev,
++						"Regulator vcc disable failed rc=%d\n", rc);
++				goto fail_disable_reg;
++			}
+ 		}
+ 		led->poweron = false;
+ 	}
+@@ -159,21 +164,26 @@ static int aw2013_power_init(struct aw2013_led *led, bool on)
+ 			}
+ 		}
+ 
+-		led->vcc = regulator_get(&led->client->dev, "vcc");
+-		if (IS_ERR(led->vcc)) {
+-			rc = PTR_ERR(led->vcc);
+-			dev_err(&led->client->dev,
+-				"Regulator get failed vcc rc=%d\n", rc);
+-			goto reg_vdd_set_vtg;
+-		}
+-
+-		if (regulator_count_voltages(led->vcc) > 0) {
+-			rc = regulator_set_voltage(led->vcc, AW2013_VI2C_MIN_UV,
+-						   AW2013_VI2C_MAX_UV);
+-			if (rc) {
++		if (led->pdata->awgpio > 0) {
++			gpio_request(led->pdata->awgpio, "aw2013-gpio");
++			gpio_direction_output(led->pdata->awgpio, 1);
++		} else {
++			led->vcc = regulator_get(&led->client->dev, "vcc");
++			if (IS_ERR(led->vcc)) {
++				rc = PTR_ERR(led->vcc);
+ 				dev_err(&led->client->dev,
+-				"Regulator set_vtg failed vcc rc=%d\n", rc);
+-				goto reg_vcc_put;
++						"Regulator get failed vcc rc=%d\n", rc);
++				goto reg_vdd_set_vtg;
++			}
++
++			if (regulator_count_voltages(led->vcc) > 0) {
++				rc = regulator_set_voltage(led->vcc, AW2013_VI2C_MIN_UV,
++						AW2013_VI2C_MAX_UV);
++				if (rc) {
++					dev_err(&led->client->dev,
++							"Regulator set_vtg failed vcc rc=%d\n", rc);
++					goto reg_vcc_put;
++				}
+ 			}
+ 		}
+ 	} else {
+@@ -182,10 +192,12 @@ static int aw2013_power_init(struct aw2013_led *led, bool on)
+ 
+ 		regulator_put(led->vdd);
+ 
+-		if (regulator_count_voltages(led->vcc) > 0)
+-			regulator_set_voltage(led->vcc, 0, AW2013_VI2C_MAX_UV);
++		if (!led->pdata->awgpio <= 0) {
++			if (regulator_count_voltages(led->vcc) > 0)
++				regulator_set_voltage(led->vcc, 0, AW2013_VI2C_MAX_UV);
+ 
+-		regulator_put(led->vcc);
++			regulator_put(led->vcc);
++		}
+ 	}
+ 	return 0;
+ 
+@@ -468,6 +480,12 @@ static int aw2013_led_parse_child_node(struct aw2013_led *led_array,
+ 			goto free_pdata;
+ 		}
+ 
++		rc = of_property_read_u32(temp, "aw2013,gpio",
++			&led->pdata->awgpio);
++		if (rc < 0) {
++			led->pdata->awgpio = 0;
++		}
++
+ 		rc = of_property_read_u32(temp, "aw2013,rise-time-ms",
+ 			&led->pdata->rise_time_ms);
+ 		if (rc < 0) {
+diff --git a/include/linux/leds-aw2013.h b/include/linux/leds-aw2013.h
+index 2ad9c3bcc144..3e9b0fe3d081 100644
+--- a/include/linux/leds-aw2013.h
++++ b/include/linux/leds-aw2013.h
+@@ -32,6 +32,7 @@ struct aw2013_platform_data {
+ 	int hold_time_ms;
+ 	int fall_time_ms;
+ 	int off_time_ms;
++	int awgpio;
+ 	struct aw2013_led *led;
+ };
+ 
+-- 
+2.17.1.windows.2
+
